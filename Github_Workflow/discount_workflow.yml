@@ -1,0 +1,316 @@
+name: release-workflow
+on:
+  release:
+    types: [published]
+
+jobs:
+  fetch-tag:
+  #it checks whether the  relese is comming from any of the main branch in our case (PROD,UAT,QA,TEST,CH_PROD) is the branch that should trigger github action
+  #if the release is from any one of the branch it will excute the below code.
+    if: github.event.release.target_commitish == 'PROD' || github.event.release.target_commitish == 'UAT' || github.event.release.target_commitish == 'QA' || github.event.release.target_commitish == 'TEST' || github.event.release.target_commitish == 'CH_PROD'
+    name : Pre-build Setups #name the job
+    # The runs-on field specifies the type of machine or environment where the job should be executed.
+    # self-hosted runners offer flexibility, control, and customization options for running GitHub Actions workflows within your own infrastructure.
+    #  (runs-on: [ "self-hosted", "docker-runner" ]), it means that the self-hosted runner you've set up is capable of running Docker.
+    runs-on: [ "self-hosted", "docker-runner" ]
+    steps:
+      - uses: actions/checkout@v3 #using the references form the action/checkout@v3 github repo
+      - name: Fetching the latest released tag #name of the job
+        id: latest_tag 
+        run: echo ::set-output name=tag::$(echo ${GITHUB_REF:10}) 
+        # echo ::set-output name=tag::$(echo ${GITHUB_REF:10}) would set the output variable tag to specific version eg:(alpha-v1.408)
+        # it will retrive the tag from .git/refs/tag 
+      - name: Configuring the AWS-ECR to be used
+        id: branch_ecr # setting id as branch_ecr
+        env:
+          branch: ${{ github.event.release.target_commitish }} # seeting branch as the branch name so it will
+          # The below code will set the ecr to speicifc name example (ecr = mcd-discount-prod) or (ecr = mcd-discount-staging)
+        run: |
+          if [ "$branch" == "PROD" ] || [ "$branch" == "CH_PROD" ]
+          then
+            echo $branch
+            echo ::set-output name=ecr::$(echo mcd-discount-prod)
+          else
+            echo $branch
+            echo ::set-output name=ecr::$(echo mcd-discount-staging)
+          fi
+          
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 
+      - name: Getting last successful build SHA
+        id: sha_old
+        uses: SamhammerAG/last-successful-build-action@v2
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          workflow: "release-workflow"
+          branch: ""
+
+    outputs:
+      release_tag: ${{steps.latest_tag.outputs.tag}}
+      ecr_repo: ${{steps.branch_ecr.outputs.ecr}}
+      github_base_sha: ${{ steps.sha_old.outputs.Sha }}
+
+  frontend-img-build:
+    needs: [fetch-tag]
+    runs-on: [ "self-hosted", "docker-runner" ]
+    name: 'Frontend Image'
+    steps:
+      - name: Configuring AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1 
+        with:
+          aws-region: us-east-1
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Installing aws-cli
+        id: install-aws-cli
+        uses: unfor19/install-aws-cli-action@master
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Checking frontend package changes
+        id: frontend-package-change
+        uses: tj-actions/changed-files@v35
+        with:
+          files: mcdui/package.json
+          base_sha: ${{ needs.fetch-tag.outputs.github_base_sha }}
+      - name: test if the frontend builder image exists
+        id: check-frontend-ecr-image
+        env:
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: frontend-builder-${{ github.event.release.target_commitish }}
+        run: |
+          aws s3 ls
+          echo "::set-output name=image_exists::$(bash env/ecr-image-exists.sh $ECR_REPOSITORY $BUILDER_IMAGE_TAG)"
+
+      - uses: actions/checkout@v3
+      - name: Run step if any package(s) are changed for frontend or if the image doesn't exist
+        if: ${{ steps.frontend-package-change.outputs.any_changed == 'true' || steps.check-frontend-ecr-image.outputs.image_exists == '0' }}
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: frontend-builder-${{ github.event.release.target_commitish }}
+        run: |
+            echo "One or more package(s) in the mcdui folder has changed."
+            echo "Does frontend builder image exist for this branch?: ${{ steps.check-frontend-ecr-image.outputs.image_exists }}"
+            echo "List all the files that have changed: ${{ steps.frontend-package-change.outputs.all_changed_files }}"
+
+            docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$BUILDER_IMAGE_TAG -f env/docker_builder/frontend_builder/Dockerfile .
+            docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+      - uses: actions/checkout@v2
+      - name: Building and pushing mcd-discount-frontend image to ECR
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: ${{ needs.fetch-tag.outputs.ecr_repo }}-frontend
+          IMAGE_TAG: ${{ needs.fetch-tag.outputs.release_tag }}
+          BUILDER_IMAGE_TAG: frontend-builder-${{ github.event.release.target_commitish }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --build-arg BUILDER_IMAGE_TAG=$BUILDER_IMAGE_TAG -f env/docker_mcdui/Dockerfile .
+          docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+  backend-img-build:
+    needs: [fetch-tag]
+    runs-on: [ "self-hosted", "docker-runner" ]
+    name: 'Backend Image'
+    steps:
+      - name: Configuring AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: us-east-1
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Installing aws-cli
+        id: install-aws-cli
+        uses: unfor19/install-aws-cli-action@master
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Checking backend requirement changes
+        id: backend-requirement-change
+        uses: tj-actions/changed-files@v35
+        with:
+          files: env/docker_mcdapi/requirements.txt
+          base_sha: ${{ needs.fetch-tag.outputs.github_base_sha }}
+      - name: test if the backend builder image exists
+        id: check-backend-ecr-image
+        env:
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: backend-builder-${{ github.event.release.target_commitish }}
+        run: |
+          echo "::set-output name=image_exists::$(bash env/ecr-image-exists.sh $ECR_REPOSITORY $BUILDER_IMAGE_TAG)"
+
+      - uses: actions/checkout@v3
+      - name: Run step if any requirement(s) are changed for backend or if the image doesn't exist
+        if: ${{ steps.backend-requirement-change.outputs.any_changed == 'true' || steps.check-backend-ecr-image.outputs.image_exists == '0' }}
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: backend-builder-${{ github.event.release.target_commitish }}
+        run: |
+            echo "One or more requirement in the mcdapi has changed."
+            echo "Does backend builder image exist for this branch?: ${{ steps.check-backend-ecr-image.outputs.image_exists }}"
+            echo "List all the files that have changed: ${{ steps.backend-requirement-change.outputs.all_changed_files }}"
+
+            docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$BUILDER_IMAGE_TAG -f env/docker_builder/backend_builder/Dockerfile .
+            docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+      - uses: actions/checkout@v2
+      - name: Building and pushing mcd-discount-backend image to ECR
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: ${{ needs.fetch-tag.outputs.ecr_repo }}-backend
+          IMAGE_TAG: ${{ needs.fetch-tag.outputs.release_tag }}
+          BUILDER_IMAGE_TAG: backend-builder-${{ github.event.release.target_commitish }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --build-arg BUILDER_IMAGE_TAG=$BUILDER_IMAGE_TAG -f env/docker_mcdapi/Dockerfile .
+          docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+  optimizer-img-build:
+    needs: [fetch-tag, frontend-img-build]
+    runs-on: [ "self-hosted", "docker-runner" ]
+    name: 'Optimizer Image'
+    steps:
+      - name: Configuring AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: us-east-1
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Installing aws-cli
+        id: install-aws-cli
+        uses: unfor19/install-aws-cli-action@master
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Checking optimizer requirement changes
+        id: optimizer-requirement-change
+        uses: tj-actions/changed-files@v35
+        with:
+          files: env/docker_lambda/optimizer/requirements.txt
+          base_sha: ${{ needs.fetch-tag.outputs.github_base_sha }}
+      - name: test if the optimizer builder image exists
+        id: check-optimizer-ecr-image
+        env:
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: optimizer-builder-${{ github.event.release.target_commitish }}
+        run: |
+          echo "::set-output name=image_exists::$(bash env/ecr-image-exists.sh $ECR_REPOSITORY $BUILDER_IMAGE_TAG)"
+
+      - uses: actions/checkout@v3
+      - name: Run step if any requirement(s) for the optimizer is changed or if the image doesn't exist
+        if: ${{ steps.optimizer-requirement-change.outputs.any_changed == 'true' || steps.check-optimizer-ecr-image.outputs.image_exists == '0' }}
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: optimizer-builder-${{ github.event.release.target_commitish }}
+        run: |
+            echo "One or more requirement in the env/docker_lambda/optimizer folder has changed."
+            echo "Does optimizer builder image exist for this branch?: ${{ steps.check-optimizer-ecr-image.outputs.image_exists }}"
+            echo "List all the files that have changed: ${{ steps.optimizer-requirement-change.outputs.all_changed_files }}"
+
+            docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$BUILDER_IMAGE_TAG -f env/docker_builder/optimizer_builder/Dockerfile .
+            docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+      - uses: actions/checkout@v2
+      - name: Building and pushing mcd-discount-staging-optimizer image to ECR
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: ${{ needs.fetch-tag.outputs.ecr_repo }}-optimizer
+          IMAGE_TAG: ${{ needs.fetch-tag.outputs.release_tag }}
+          BUILDER_IMAGE_TAG: optimizer-builder-${{ github.event.release.target_commitish }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --build-arg BUILDER_IMAGE_TAG=$BUILDER_IMAGE_TAG -f env/docker_lambda/optimizer/Dockerfile .
+          docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+  reports-imgs-build:
+    needs: [fetch-tag, backend-img-build ]
+    runs-on: [ "self-hosted", "docker-runner" ]
+    name: 'Reports Images'
+    steps:
+      - name: Configuring AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: us-east-1
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Installing aws-cli
+        id: install-aws-cli
+        uses: unfor19/install-aws-cli-action@master
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Checking report requirement changes
+        id: report-requirement-change
+        uses: tj-actions/changed-files@v35
+        with:
+          files: env/docker_lambda/reports/requirements.txt
+          base_sha: ${{ needs.fetch-tag.outputs.github_base_sha }}
+      - name: test if the report builder image exists
+        id: check-reports-ecr-image
+        env:
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: reports-builder-${{ github.event.release.target_commitish }}
+        run: |
+          echo "::set-output name=image_exists::$(bash env/ecr-image-exists.sh $ECR_REPOSITORY $BUILDER_IMAGE_TAG)"
+
+
+      - uses: actions/checkout@v3
+      - name: Run step if any requirement(s) for the report is changed or if the image doesn't exist
+        if: ${{ steps.report-requirement-change.outputs.any_changed == 'true' || steps.check-reports-ecr-image.outputs.image_exists == '0' }}
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: mcd-discount-builder-images
+          BUILDER_IMAGE_TAG: reports-builder-${{ github.event.release.target_commitish }}
+        run: |
+            echo "One or more requirement(s) in the env/docker_lambda/reports has changed."
+            echo "Does reports builder image exist for this branch?: ${{ steps.check-reports-ecr-image.outputs.image_exists }}"
+            echo "List all the files that have changed: ${{ steps.report-requirement-change.outputs.all_changed_files }}"
+
+            docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$BUILDER_IMAGE_TAG -f env/docker_builder/report_builder/Dockerfile .
+            docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+      - uses: actions/checkout@v2
+      - name: Building and pushing reports images to ECR
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPOSITORY: ${{ needs.fetch-tag.outputs.ecr_repo }}-report-lambda
+          IMAGE_TAG: ${{ needs.fetch-tag.outputs.release_tag }}
+          BUILDER_IMAGE_TAG: reports-builder-${{ github.event.release.target_commitish }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --build-arg BUILDER_IMAGE_TAG=$BUILDER_IMAGE_TAG -f env/docker_lambda/reports/Dockerfile .
+          docker push -a $ECR_REGISTRY/$ECR_REPOSITORY
+
+  invokers-imgs-build:
+    needs: [fetch-tag, reports-imgs-build]
+    runs-on: [ "self-hosted", "docker-runner" ]
+    name: 'Invokers Images'
+    steps:
+      - name: Configuring AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: us-east-1
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - uses: actions/checkout@v2
+      - name: Building and pushing invokers images to ECR
+        env:
+          ECR_REGISTRY: 059014103288.dkr.ecr.us-east-1.amazonaws.com
+          BATCH_REPOSITORY: ${{ needs.fetch-tag.outputs.ecr_repo }}-batch-invoke
+          SP_REPOSITORY: ${{ needs.fetch-tag.outputs.ecr_repo }}-sp-invoke-lambda
+          IMAGE_TAG: ${{ needs.fetch-tag.outputs.release_tag }}
+        run: |
+          docker build --target batch -t $ECR_REGISTRY/$BATCH_REPOSITORY:$IMAGE_TAG -f env/docker_lambda/invoker/Dockerfile .
+          docker push -a $ECR_REGISTRY/$BATCH_REPOSITORY
+          docker build --target sp -t $ECR_REGISTRY/$SP_REPOSITORY:$IMAGE_TAG -f env/docker_lambda/invoker/Dockerfile .
+          docker push -a $ECR_REGISTRY/$SP_REPOSITORY
